@@ -17,16 +17,34 @@ function safeJsonParse(text) {
   }
 }
 
+const REQUEST_TIMEOUT_MS = 30000;
+
 async function postChatCompletions(transport, body, label) {
   const baseURL = String(transport.baseURL || "").replace(/\/+$/, "");
-  const response = await fetch(`${baseURL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${transport.apiKey}`
-    },
-    body: JSON.stringify(body)
-  });
+  // Without a timeout a hung provider leaves the request pending forever, so the
+  // UI stays stuck on "Reading…" and Stop (a between-iterations flag) can't
+  // cancel the in-flight call. Abort after REQUEST_TIMEOUT_MS instead.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(`${baseURL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${transport.apiKey}`
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`${label} timed out after ${REQUEST_TIMEOUT_MS / 1000}s — the provider did not respond.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     const error = new Error(`${label} failed: ${response.status} ${text.slice(0, 160)}`);
