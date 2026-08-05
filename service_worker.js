@@ -17,7 +17,30 @@ function safeJsonParse(text) {
   }
 }
 
-const REQUEST_TIMEOUT_MS = 30000;
+const REQUEST_TIMEOUT_MS = 60000;
+
+function isOllamaTransport(transport) {
+  try {
+    const url = new URL(String(transport?.baseURL || ""));
+    return url.port === "11434" || /ollama/i.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function prepareMessagesForOllama(messages) {
+  return [
+    {
+      role: "system",
+      content: "For this request, do not output reasoning. Answer immediately with only compact valid JSON."
+    },
+    ...(messages || [])
+  ];
+}
+
+function choiceReasoning(choice) {
+  return choice?.message?.reasoning || choice?.message?.reasoning_content || "";
+}
 
 async function postChatCompletions(transport, body, label) {
   const baseURL = String(transport.baseURL || "").replace(/\/+$/, "");
@@ -58,13 +81,20 @@ async function requestChatJson({ transport, payload, label }) {
   if (!transport?.apiKey) throw new Error(`${label}: add a provider API key first.`);
   if (!transport?.baseURL) throw new Error(`${label}: set the provider base URL first.`);
 
+  const isOllama = isOllamaTransport(transport);
+  const messages = isOllama ? prepareMessagesForOllama(payload.messages) : payload.messages;
+  const maxTokens = payload.maxTokens || 450;
   const baseBody = {
     model: payload.model,
-    messages: payload.messages,
+    messages,
     temperature: payload.temperature ?? 0.2,
-    max_tokens: payload.maxTokens || 450,
+    max_tokens: isOllama ? Math.max(maxTokens, 1200) : maxTokens,
     stream: false
   };
+  if (isOllama) {
+    baseBody.keep_alive = "1m";
+    baseBody.think = false;
+  }
   if (payload.jsonMode) baseBody.response_format = { type: "json_object" };
 
   let content = "";
@@ -86,10 +116,10 @@ async function requestChatJson({ transport, payload, label }) {
   const retryBody = {
     ...baseBody,
     messages: [
-      ...payload.messages,
+      ...messages,
       { role: "user", content: "Return ONLY a compact JSON object now, exactly like {\"title\":\"...\"}. No markdown. No explanation." }
     ],
-    max_tokens: Math.max(baseBody.max_tokens, 700)
+    max_tokens: Math.max(baseBody.max_tokens, isOllama ? 1800 : 700)
   };
   delete retryBody.response_format;
 
@@ -99,7 +129,8 @@ async function requestChatJson({ transport, payload, label }) {
   const parsed = content ? safeJsonParse(content) : null;
   if (!parsed) {
     const finish = choice.finish_reason ? ` finish_reason=${choice.finish_reason}` : "";
-    const reason = choice.message?.reasoning_content ? ` reasoning=${String(choice.message.reasoning_content).slice(0, 120)}` : "";
+    const reasoning = choiceReasoning(choice);
+    const reason = reasoning ? ` reasoning=${String(reasoning).slice(0, 120)}` : "";
     throw new Error(`${label} returned empty or invalid JSON:${finish}${reason} content=${content.slice(0, 120)}`);
   }
   return { parsed, content };

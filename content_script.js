@@ -1021,6 +1021,11 @@
     const readyRows = rows.filter((r) => normalizeText(r.querySelector(".title")?.value || ""));
     if (!readyRows.length) { setCardSummary(root, "No titles to apply."); return; }
 
+    // ChatGPT moves each renamed conversation to the top of the sidebar. Apply
+    // bottom-to-top so the final sidebar order matches the review list instead
+    // of being reversed by successive renames.
+    const applyRows = [...readyRows].reverse();
+
     root.querySelector(".wf-stop").style.display = "";
     root.querySelector(".wf-apply").disabled = true;
     root.querySelector(".wf-generate").disabled = true;
@@ -1029,7 +1034,7 @@
 
     let renamed = 0, failed = 0;
 
-    for (const [index, row] of readyRows.entries()) {
+    for (const [index, row] of applyRows.entries()) {
       if (stopRequested) {
         setCardSummary(root, `Stopped — ${renamed} / ${readyRows.length} renamed.`);
         break;
