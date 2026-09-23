@@ -39,6 +39,9 @@ function render() {
   populateProviders();
   $("providerSelect").value = settings.providerId || config.DEFAULT_PROVIDER_ID;
   $("languageSelect").value = settings.titleLanguage || "auto";
+  $("paceSelect").value = settings.requestPace || "normal";
+  $("delayMin").value = String((settings.requestDelayMinMs || 0) / 1000);
+  $("delayMax").value = String((settings.requestDelayMaxMs || 0) / 1000);
   fillFields();
 }
 
@@ -68,6 +71,17 @@ async function init() {
 }
 
 $("providerSelect").addEventListener("change", fillFields);
+$("paceSelect").addEventListener("change", () => {
+  const preset = config.REQUEST_PACES[$("paceSelect").value];
+  if (!preset || preset.minMs == null || preset.maxMs == null) return;
+  $("delayMin").value = String(preset.minMs / 1000);
+  $("delayMax").value = String(preset.maxMs / 1000);
+});
+for (const input of [$("delayMin"), $("delayMax")]) {
+  input.addEventListener("input", () => {
+    $("paceSelect").value = "custom";
+  });
+}
 
 $("saveSettings").addEventListener("click", async () => {
   const id = $("providerSelect").value;
@@ -77,6 +91,9 @@ $("saveSettings").addEventListener("click", async () => {
     ...settings,
     providerId: id,
     titleLanguage: $("languageSelect").value || "auto",
+    requestPace: $("paceSelect").value || "normal",
+    requestDelayMinMs: Number($("delayMin").value || 0) * 1000,
+    requestDelayMaxMs: Number($("delayMax").value || 0) * 1000,
     providers: {
       ...settings.providers,
       [id]: {

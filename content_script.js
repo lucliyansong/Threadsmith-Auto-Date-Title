@@ -10,9 +10,17 @@
 
   let settings = config.normalizeSettings(null);
   let stopRequested = false;
+  let activeOperation = "";
+  let pauseReason = "";
+  let rateLimitCheckQueued = false;
+  const creationDateCache = new Map();
+
+  const RATE_LIMIT_RE = /(?:请求过于频繁|请稍等几分钟后再试|请稍等几分钟后重试|too many requests|rate[ -]?limit|try again in (?:a )?few minutes|\b429\b)/i;
 
   function languageFor(sample) {
-    return prompts.resolveLanguage(settings.titleLanguage, sample);
+    // This customized build always uses the user's Chinese naming taxonomy.
+    // The prompt still preserves English proper nouns and technical names.
+    return "zh";
   }
 
   function getSessionIdFromUrl(url) {
@@ -23,8 +31,158 @@
     return (text || "").replace(/\s+/g, " ").trim();
   }
 
+  function formatShanghaiDate(unixSeconds) {
+    const value = Number(unixSeconds);
+    if (!Number.isFinite(value) || value <= 0) return "";
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Shanghai",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(new Date(value * 1000));
+    const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return byType.year && byType.month && byType.day
+      ? `${byType.year}-${byType.month}-${byType.day}`
+      : "";
+  }
+
+  function sessionTimestampFromId(id) {
+    const prefix = String(id || "").match(/^([0-9a-f]{8})-/i)?.[1];
+    if (!prefix) return 0;
+
+    const value = Number.parseInt(prefix, 16);
+    const earliestSupported = Date.UTC(2020, 0, 1) / 1000;
+    const latestReasonable = Date.now() / 1000 + 7 * 24 * 60 * 60;
+    return Number.isFinite(value) && value >= earliestSupported && value <= latestReasonable
+      ? value
+      : 0;
+  }
+
+  function earliestMessageCreateTime(payload) {
+    const values = Object.values(payload?.mapping || {})
+      .map((node) => Number(node?.message?.create_time))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    return values.length ? Math.min(...values) : 0;
+  }
+
+  async function getConversationCreationDate(id) {
+    if (creationDateCache.has(id)) return creationDateCache.get(id);
+
+    let unixSeconds = 0;
+    let responseStatus = 0;
+    try {
+      const response = await fetch(`/backend-api/conversation/${encodeURIComponent(id)}`, {
+        credentials: "include",
+        headers: { Accept: "application/json" }
+      });
+      responseStatus = response.status;
+      if (response.ok) {
+        const payload = await response.json();
+        unixSeconds = Number(payload?.create_time) || earliestMessageCreateTime(payload);
+      }
+    } catch {
+      // ChatGPT's internal conversation endpoint is not stable. Fall through to
+      // the timestamp encoded in current conversation IDs.
+    }
+
+    if (!unixSeconds) unixSeconds = sessionTimestampFromId(id);
+    const date = formatShanghaiDate(unixSeconds);
+    if (!date) {
+      const suffix = responseStatus ? ` (${responseStatus})` : "";
+      throw new Error(`Could not read creation time${suffix}.`);
+    }
+    creationDateCache.set(id, date);
+    return date;
+  }
+
+  function withCreationDate(date, generatedTitle) {
+    const clean = normalizeText(generatedTitle)
+      .replace(/^\d{4}-\d{2}-\d{2}[｜|]\s*/, "")
+      .replace(/\s*[|]\s*/g, "｜");
+    if (!/^[^｜]{1,12}｜[^｜]{2,}$/.test(clean)) {
+      throw new Error(`Provider did not return 类型｜简短标题: ${clean}`);
+    }
+    return `${date}｜${clean}`;
+  }
+
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function randomRequestDelayMs(currentSettings) {
+    const min = Math.max(0, Number(currentSettings?.requestDelayMinMs) || 0);
+    const max = Math.max(min, Number(currentSettings?.requestDelayMaxMs) || min);
+    return Math.round(min + Math.random() * (max - min));
+  }
+
+  function visibleRateLimitWarning() {
+    const candidates = document.querySelectorAll(
+      '[role="dialog"], [aria-modal="true"], [role="alert"], [data-sonner-toast]'
+    );
+    for (const element of candidates) {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      if (style.display === "none" || style.visibility === "hidden" || !rect.width || !rect.height) continue;
+      const text = normalizeText(element.textContent || "");
+      if (RATE_LIMIT_RE.test(text)) return text;
+    }
+    return "";
+  }
+
+  function isRateLimitError(error) {
+    return Number(error?.status) === 429 || RATE_LIMIT_RE.test(error?.message || String(error || ""));
+  }
+
+  function throwIfPageRateLimited() {
+    if (!visibleRateLimitWarning()) return;
+    const error = new Error("ChatGPT: requests are too frequent. Try again in a few minutes.");
+    error.status = 429;
+    throw error;
+  }
+
+  function requestAutomaticRateLimitPause(root, error = null) {
+    const warning = visibleRateLimitWarning();
+    if (!warning && !isRateLimitError(error)) return false;
+
+    stopRequested = true;
+    pauseReason = "rate-limit";
+    const pauseButton = activeOperation === "apply"
+      ? root?.querySelector(".wf-pause-apply")
+      : root?.querySelector(".wf-pause-generate");
+    if (pauseButton) {
+      pauseButton.disabled = true;
+      pauseButton.textContent = "Auto-paused";
+    }
+    if (root) setCardSummary(root, "Auto-paused — ChatGPT/provider reported requests too frequent.");
+    return true;
+  }
+
+  function installRateLimitObserver() {
+    const observer = new MutationObserver(() => {
+      if (!activeOperation || rateLimitCheckQueued) return;
+      rateLimitCheckQueued = true;
+      setTimeout(() => {
+        rateLimitCheckQueued = false;
+        if (!activeOperation) return;
+        requestAutomaticRateLimitPause(cardRoot());
+      }, 50);
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+  }
+
+  async function waitForNextRequest(root, currentSettings) {
+    const delay = randomRequestDelayMs(currentSettings);
+    if (requestAutomaticRateLimitPause(root)) return false;
+    if (!delay) return !stopRequested;
+
+    const deadline = Date.now() + delay;
+    while (Date.now() < deadline) {
+      if (requestAutomaticRateLimitPause(root) || stopRequested) return false;
+      const remaining = Math.max(0, deadline - Date.now());
+      setCardSummary(root, `Waiting ${(remaining / 1000).toFixed(1)}s before the next request…`);
+      await sleep(Math.min(250, remaining));
+    }
+    return !stopRequested;
   }
 
   function isBoilerplateText(text) {
@@ -62,13 +220,20 @@
 
   function visibleSidebarSessions() {
     const seen = new Set();
-    return [...document.querySelectorAll('a[href*="/c/"]')]
+    const sessions = [...document.querySelectorAll('a[href*="/c/"]')]
       .map((anchor) => {
         const id = getSessionIdFromUrl(anchor.href || "");
         const title = normalizeText(anchor.getAttribute("aria-label") || anchor.innerText || anchor.textContent);
-        return { id, title, url: anchor.href };
+        return { id, title, url: anchor.href, createdAt: sessionTimestampFromId(id) };
       })
       .filter((item) => item.id && item.title && item.title.length < 160 && !seen.has(item.id) && seen.add(item.id));
+
+    // ChatGPT can move a recently-opened old conversation to the top. When
+    // current IDs expose a validated creation timestamp, order by that instead
+    // so "recent" means newly created rather than recently viewed.
+    return sessions.every((session) => session.createdAt)
+      ? sessions.sort((a, b) => b.createdAt - a.createdAt)
+      : sessions;
   }
 
   function extractConversationText() {
@@ -234,6 +399,7 @@
 
   async function generateTitleSuggestion(target) {
     const messages = await openConversation(target.id, target.url);
+    throwIfPageRateLimited();
     if (!messages.length) throw new Error("No conversation text found.");
     if (getSessionIdFromUrl(location.href) !== target.id) {
       throw new Error("Could not open the target conversation before reading content.");
@@ -243,10 +409,11 @@
     // auto-detect from the conversation text (plus the old title as a hint).
     const sample = `${target.title} ${messages.map((m) => m.text).join(" ")}`.slice(0, 600);
     const language = languageFor(sample);
+    const creationDate = await getConversationCreationDate(target.id);
 
     try {
       return {
-        title: await suggestTitle(target.title, messages, language),
+        title: withCreationDate(creationDate, await suggestTitle(target.title, messages, language)),
         repaired: false
       };
     } catch (error) {
@@ -255,7 +422,7 @@
       if (error.status) throw error;
       const repaired = await repairTitle(target.title, messages, "No usable title from first pass", error.message || String(error), language);
       return {
-        title: repaired,
+        title: withCreationDate(creationDate, repaired),
         repaired: true,
         repairReason: error.message || String(error)
       };
@@ -366,6 +533,7 @@
     editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
     editor.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
     await sleep(900);
+    throwIfPageRateLimited();
     return { id, title: newTitle };
   }
 
@@ -374,7 +542,9 @@
     try {
       await renameInChatGpt(target.id, title, options);
     } catch (firstError) {
+      if (stopRequested || isRateLimitError(firstError) || visibleRateLimitWarning()) throw firstError;
       await openConversation(target.id, target.url);
+      throwIfPageRateLimited();
       await renameInChatGpt(target.id, title, options);
     }
   }
@@ -390,7 +560,14 @@
   }
 
   function selectedRows(root) {
-    return allRows(root).filter((r) => r.querySelector('input[type="checkbox"]').checked);
+    return allRows(root).filter((r) => {
+      const checkbox = r.querySelector('input[type="checkbox"]');
+      return checkbox.checked && !checkbox.disabled;
+    });
+  }
+
+  function isFormattedConversationTitle(title) {
+    return /^\d{4}-\d{2}-\d{2}｜[^｜]{1,12}｜[^｜]{2,}$/.test(normalizeText(title));
   }
 
   function switchPhase(root, phase) {
@@ -416,9 +593,11 @@
   }
 
   function updateWorkflowCount(root) {
-    const total = allRows(root).length;
+    const rows = allRows(root);
+    const eligible = rows.filter((row) => row.dataset.formatted !== "true").length;
+    const formatted = rows.length - eligible;
     const sel = selectedRows(root).length;
-    setCardSummary(root, `${sel} / ${total} selected`);
+    setCardSummary(root, `${sel} / ${eligible} selected${formatted ? ` · ${formatted} already formatted` : ""}`);
   }
 
   function updateIdleCount(root) {
@@ -531,6 +710,7 @@
 
         /* Phase visibility */
         .card[data-phase="idle"] .tools-bar,
+        .card[data-phase="idle"] .workflow-settings,
         .card[data-phase="idle"] .session-list,
         .card[data-phase="idle"] .wf-footer { display: none; }
         .card[data-phase="workflow"] .idle-body { display: none; }
@@ -576,6 +756,25 @@
           flex-shrink: 0;
         }
         .tools-bar .spacer { flex: 1; }
+
+        /* Request interval controls stay available on the ChatGPT page while
+           reviewing, generating, or applying titles. */
+        .workflow-settings {
+          padding: 6px 10px;
+          background: var(--bg-s);
+          border-bottom: 1px solid var(--bd-s);
+          flex-shrink: 0;
+        }
+        .workflow-settings details { background: var(--bg-i); }
+        .workflow-pace-grid {
+          display: grid; grid-template-columns: 1.35fr .65fr .65fr;
+          gap: 6px; padding: 0 8px 8px;
+        }
+        .workflow-pace-actions {
+          display: flex; align-items: center; gap: 8px;
+          padding: 0 8px 8px;
+        }
+        .workflow-pace-feedback { color: var(--text3); font-size: 11px; }
 
         /* ── Session list ── */
         .session-list {
@@ -655,15 +854,17 @@
 
         /* ── Workflow footer ── */
         .wf-footer {
-          display: flex; align-items: center; gap: 8px;
+          display: flex; flex-direction: column; align-items: stretch; gap: 7px;
           padding: 9px 10px;
           border-top: 1px solid var(--bd-s);
           background: var(--bg-s);
           flex-shrink: 0;
         }
         .wf-summary { font-size: 12px; color: var(--text3); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .wf-actions { display: flex; gap: 5px; flex-shrink: 0; }
-        .wf-stop { display: none; }
+        .wf-actions {
+          display: grid; grid-template-columns: 1fr 1fr;
+          gap: 5px; flex-shrink: 0;
+        }
 
         /* ── All buttons ── */
         button {
@@ -726,6 +927,14 @@
                 <option value="zh">中文</option>
                 <option value="en">English</option>
               </select></label>
+              <label>Request pace<select class="si pace-select">
+                <option value="fast">Fast (0.5–1.5s)</option>
+                <option value="normal">Normal (2–4s)</option>
+                <option value="slow">Slow (5–8s)</option>
+                <option value="custom">Custom range</option>
+              </select></label>
+              <label>Minimum delay (seconds)<input class="si delay-min" type="number" min="0" max="60" step="0.1"></label>
+              <label>Maximum delay (seconds)<input class="si delay-max" type="number" min="0" max="60" step="0.1"></label>
               <button class="save-settings">Save</button>
             </div>
           </details>
@@ -740,14 +949,35 @@
           <button class="back-btn">← Back</button>
         </div>
 
+        <div class="workflow-settings">
+          <details class="workflow-pace-details">
+            <summary>⏱ Request interval</summary>
+            <div class="workflow-pace-grid">
+              <label>Speed<select class="si wf-pace-select">
+                <option value="fast">Fast</option>
+                <option value="normal">Normal</option>
+                <option value="slow">Slow</option>
+                <option value="custom">Custom</option>
+              </select></label>
+              <label>Min (s)<input class="si wf-delay-min" type="number" min="0" max="60" step="0.1"></label>
+              <label>Max (s)<input class="si wf-delay-max" type="number" min="0" max="60" step="0.1"></label>
+            </div>
+            <div class="workflow-pace-actions">
+              <button class="save-workflow-pace">Save interval</button>
+              <span class="workflow-pace-feedback"></span>
+            </div>
+          </details>
+        </div>
+
         <div class="session-list"></div>
 
         <div class="wf-footer">
           <div class="wf-summary"></div>
           <div class="wf-actions">
-            <button class="wf-stop">Stop</button>
             <button class="wf-generate primary">Generate</button>
+            <button class="wf-pause-generate" disabled>Pause Generate</button>
             <button class="wf-apply" disabled>Apply</button>
+            <button class="wf-pause-apply" disabled>Pause Apply</button>
           </div>
         </div>
 
@@ -773,6 +1003,29 @@
 
     // Idle phase
     root.querySelector(".provider-select").addEventListener("change", () => fillProviderFields(root));
+    root.querySelector(".pace-select").addEventListener("change", () => {
+      const preset = config.REQUEST_PACES[root.querySelector(".pace-select").value];
+      if (!preset || preset.minMs == null || preset.maxMs == null) return;
+      root.querySelector(".delay-min").value = String(preset.minMs / 1000);
+      root.querySelector(".delay-max").value = String(preset.maxMs / 1000);
+    });
+    for (const input of [root.querySelector(".delay-min"), root.querySelector(".delay-max")]) {
+      input.addEventListener("input", () => {
+        root.querySelector(".pace-select").value = "custom";
+      });
+    }
+
+    root.querySelector(".wf-pace-select").addEventListener("change", () => {
+      const preset = config.REQUEST_PACES[root.querySelector(".wf-pace-select").value];
+      if (!preset || preset.minMs == null || preset.maxMs == null) return;
+      root.querySelector(".wf-delay-min").value = String(preset.minMs / 1000);
+      root.querySelector(".wf-delay-max").value = String(preset.maxMs / 1000);
+    });
+    for (const input of [root.querySelector(".wf-delay-min"), root.querySelector(".wf-delay-max")]) {
+      input.addEventListener("input", () => {
+        root.querySelector(".wf-pace-select").value = "custom";
+      });
+    }
 
     root.querySelector(".save-settings").addEventListener("click", async () => {
       const id = root.querySelector(".provider-select").value;
@@ -781,6 +1034,9 @@
         ...settings,
         providerId: id,
         titleLanguage: root.querySelector(".language-select").value || "auto",
+        requestPace: root.querySelector(".pace-select").value || "normal",
+        requestDelayMinMs: Number(root.querySelector(".delay-min").value || 0) * 1000,
+        requestDelayMaxMs: Number(root.querySelector(".delay-max").value || 0) * 1000,
         providers: {
           ...settings.providers,
           [id]: {
@@ -792,11 +1048,35 @@
       };
       try {
         settings = await config.saveSettings(next);
+        root.querySelector(".wf-pace-select").value = settings.requestPace;
+        root.querySelector(".wf-delay-min").value = String(settings.requestDelayMinMs / 1000);
+        root.querySelector(".wf-delay-max").value = String(settings.requestDelayMaxMs / 1000);
         root.querySelector(".feedback").textContent = preset.custom
           ? "Saved. For a custom endpoint, open the toolbar popup once to grant host access."
           : "Settings saved.";
       } catch (error) {
         root.querySelector(".feedback").textContent = error.message || "Could not save settings.";
+      }
+    });
+
+    root.querySelector(".save-workflow-pace").addEventListener("click", async () => {
+      const feedback = root.querySelector(".workflow-pace-feedback");
+      try {
+        settings = await config.saveSettings({
+          ...settings,
+          requestPace: root.querySelector(".wf-pace-select").value || "normal",
+          requestDelayMinMs: Number(root.querySelector(".wf-delay-min").value || 0) * 1000,
+          requestDelayMaxMs: Number(root.querySelector(".wf-delay-max").value || 0) * 1000
+        });
+        root.querySelector(".pace-select").value = settings.requestPace;
+        root.querySelector(".delay-min").value = String(settings.requestDelayMinMs / 1000);
+        root.querySelector(".delay-max").value = String(settings.requestDelayMaxMs / 1000);
+        root.querySelector(".wf-pace-select").value = settings.requestPace;
+        root.querySelector(".wf-delay-min").value = String(settings.requestDelayMinMs / 1000);
+        root.querySelector(".wf-delay-max").value = String(settings.requestDelayMaxMs / 1000);
+        feedback.textContent = `Saved: ${settings.requestDelayMinMs / 1000}–${settings.requestDelayMaxMs / 1000}s`;
+      } catch (error) {
+        feedback.textContent = error.message || "Could not save interval.";
       }
     });
 
@@ -806,15 +1086,32 @@
     root.querySelector(".back-btn").addEventListener("click", () => {
       stopRequested = true;
       switchPhase(root, "idle");
+      if (allRows(root).length) root.querySelector(".start-btn").textContent = "Return to Review";
       updateIdleCount(root);
     });
 
-    root.querySelector(".wf-stop").addEventListener("click", () => {
+    root.querySelector(".wf-pause-generate").addEventListener("click", () => {
       stopRequested = true;
+      pauseReason = "manual";
+      const button = root.querySelector(".wf-pause-generate");
+      button.disabled = true;
+      button.textContent = "Pausing…";
+      setCardSummary(root, "Pausing generation after the current session…");
+    });
+    root.querySelector(".wf-pause-apply").addEventListener("click", () => {
+      stopRequested = true;
+      pauseReason = "manual";
+      const button = root.querySelector(".wf-pause-apply");
+      button.disabled = true;
+      button.textContent = "Pausing…";
+      setCardSummary(root, "Pausing Apply after the current session…");
     });
 
     root.querySelector(".sel-all").addEventListener("click", () => {
-      allRows(root).forEach((r) => (r.querySelector('input[type="checkbox"]').checked = true));
+      allRows(root).forEach((r) => {
+        const checkbox = r.querySelector('input[type="checkbox"]');
+        if (!checkbox.disabled) checkbox.checked = true;
+      });
       updateWorkflowCount(root);
     });
     root.querySelector(".sel-none").addEventListener("click", () => {
@@ -823,14 +1120,23 @@
     });
     root.querySelector(".refresh-btn").addEventListener("click", () => refreshSessions(root));
     root.querySelector(".session-list").addEventListener("change", () => updateWorkflowCount(root));
-    root.querySelector(".session-list").addEventListener("input", () => {
-      const hasTitle = allRows(root).some((r) => normalizeText(r.querySelector(".title")?.value || ""));
+    root.querySelector(".session-list").addEventListener("input", (event) => {
+      if (event.target?.matches?.(".title") && normalizeText(event.target.value || "")) {
+        delete event.target.closest(".row")?.dataset.generateFailed;
+      }
+      const hasTitle = selectedRows(root).some((r) =>
+        r.dataset.renamed !== "true" && normalizeText(r.querySelector(".title")?.value || "")
+      );
       root.querySelector(".wf-apply").disabled = !hasTitle;
     });
 
     root.querySelector(".wf-generate").addEventListener("click", async () => {
-      const rows = selectedRows(root);
-      if (!rows.length) { setCardSummary(root, "Select at least one session first."); return; }
+      const selected = selectedRows(root);
+      if (!selected.length) { setCardSummary(root, "Select at least one unformatted session first."); return; }
+      const rows = selected.filter((row) =>
+        row.dataset.generateFailed === "true" || !normalizeText(row.querySelector(".title")?.value || "")
+      );
+      if (!rows.length) { setCardSummary(root, "All selected sessions already have previews."); return; }
       await generatePreview(rows, root);
     });
 
@@ -868,18 +1174,26 @@
     populateProviderSelect(root);
     root.querySelector(".provider-select").value = settings.providerId || config.DEFAULT_PROVIDER_ID;
     root.querySelector(".language-select").value = settings.titleLanguage || "auto";
+    root.querySelector(".pace-select").value = settings.requestPace || "normal";
+    root.querySelector(".delay-min").value = String((settings.requestDelayMinMs || 0) / 1000);
+    root.querySelector(".delay-max").value = String((settings.requestDelayMaxMs || 0) / 1000);
+    root.querySelector(".wf-pace-select").value = settings.requestPace || "normal";
+    root.querySelector(".wf-delay-min").value = String((settings.requestDelayMinMs || 0) / 1000);
+    root.querySelector(".wf-delay-max").value = String((settings.requestDelayMaxMs || 0) / 1000);
     fillProviderFields(root);
   }
 
   function createSessionRow(target, { checked = false } = {}) {
+    const formatted = isFormattedConversationTitle(target.title);
     const row = document.createElement("div");
     row.className = "row";
     row.dataset.id = target.id;
+    row.dataset.formatted = String(formatted);
     row.innerHTML = `
-      <input type="checkbox" ${checked ? "checked" : ""}>
+      <input type="checkbox" ${checked && !formatted ? "checked" : ""} ${formatted ? "disabled" : ""}>
       <div class="row-old"></div>
-      <div class="row-status">Queued</div>
-      <div class="row-title-wrap"><input class="title" type="text" placeholder="Generate to preview"></div>
+      <div class="row-status">${formatted ? "Already formatted" : "Queued"}</div>
+      <div class="row-title-wrap"><input class="title" type="text" placeholder="${formatted ? "No generation needed" : "Generate to preview"}" ${formatted ? "disabled" : ""}></div>
       <div class="row-detail"></div>
     `;
     row.querySelector(".row-old").textContent = target.title;
@@ -894,10 +1208,23 @@
       list.innerHTML = `<div class="no-sessions">No sessions visible yet.<br>Scroll the ChatGPT sidebar to load your history.</div>`;
       return;
     }
-    targets.forEach((target, index) => list.append(createSessionRow(target, { checked: index === 0 })));
+    let selectedFirst = false;
+    targets.forEach((target) => {
+      const checked = !selectedFirst && !isFormattedConversationTitle(target.title);
+      if (checked) selectedFirst = true;
+      list.append(createSessionRow(target, { checked }));
+    });
   }
 
   function startWorkflow(root) {
+    // Returning from Settings should preserve selections, generated previews,
+    // and apply progress. Refresh remains available when a fresh sidebar scan
+    // is wanted explicitly.
+    if (allRows(root).length) {
+      updateWorkflowCount(root);
+      switchPhase(root, "workflow");
+      return;
+    }
     renderSessionRows(root, visibleSidebarSessions());
     updateWorkflowCount(root);
     switchPhase(root, "workflow");
@@ -932,6 +1259,8 @@
 
   async function generatePreview(rows, root) {
     stopRequested = false;
+    pauseReason = "";
+    activeOperation = "";
     try {
       settings = await config.loadSettings();
     } catch (error) {
@@ -943,16 +1272,22 @@
       return;
     }
 
-    root.querySelector(".wf-stop").style.display = "";
+    activeOperation = "generate";
+
+    root.querySelector(".wf-pause-generate").disabled = false;
+    root.querySelector(".wf-pause-generate").textContent = "Pause Generate";
+    root.querySelector(".wf-pause-apply").disabled = true;
     root.querySelector(".wf-generate").disabled = true;
+    root.querySelector(".wf-apply").disabled = true;
     root.querySelector(".back-btn").disabled = true;
     root.querySelector(".refresh-btn").disabled = true;
+    requestAutomaticRateLimitPause(root);
 
-    let generated = 0, repaired = 0, skipped = 0;
+    let generated = 0, repaired = 0, skipped = 0, paused = false;
 
     for (const [index, row] of rows.entries()) {
-      if (stopRequested) {
-        setCardSummary(root, `Stopped — ${generated} / ${rows.length} generated.`);
+      if (requestAutomaticRateLimitPause(root) || stopRequested) {
+        paused = true;
         break;
       }
       const target = row._target;
@@ -961,6 +1296,7 @@
       try {
         const suggestion = await generateTitleSuggestion(target);
         row.querySelector(".title").value = suggestion.title;
+        delete row.dataset.generateFailed;
         row.dataset.ready = "true";
         row.classList.add("has-title");
         generated++;
@@ -968,22 +1304,49 @@
         setRowStatus(row, suggestion.repaired ? "Repaired" : "Ready", "ok");
       } catch (error) {
         skipped++;
-        setRowStatus(row, "Skipped", "error", error.message || "generation failed");
+        row.dataset.generateFailed = "true";
+        requestAutomaticRateLimitPause(root, error);
+        setRowStatus(row, "Retry queued", "error", error.message || "generation failed");
+      }
+
+      if (stopRequested) {
+        paused = true;
+        break;
+      }
+      if (index < rows.length - 1 && !(await waitForNextRequest(root, settings))) {
+        paused = true;
+        break;
       }
     }
 
-    const hasTitle = allRows(root).some((r) => normalizeText(r.querySelector(".title")?.value || ""));
-    root.querySelector(".wf-apply").disabled = !hasTitle;
-    root.querySelector(".wf-stop").style.display = "none";
+    const remainingGenerate = selectedRows(root).some((row) =>
+      row.dataset.generateFailed === "true" || !normalizeText(row.querySelector(".title")?.value || "")
+    );
+    const remainingApply = selectedRows(root).some((row) =>
+      row.dataset.renamed !== "true" && normalizeText(row.querySelector(".title")?.value || "")
+    );
+    root.querySelector(".wf-apply").disabled = !remainingApply;
+    root.querySelector(".wf-pause-generate").disabled = true;
+    root.querySelector(".wf-pause-generate").textContent = "Pause Generate";
     root.querySelector(".wf-generate").disabled = false;
+    root.querySelector(".wf-generate").textContent = paused && remainingGenerate
+      ? "Resume Generate"
+      : (remainingGenerate ? "Retry Failed" : "Generate");
     root.querySelector(".back-btn").disabled = false;
     root.querySelector(".refresh-btn").disabled = false;
-    setCardSummary(root, `Done — ${generated} ready${repaired ? `, ${repaired} repaired` : ""}${skipped ? `, ${skipped} skipped` : ""}.`);
+    const stoppedForRateLimit = pauseReason === "rate-limit";
+    activeOperation = "";
+    setCardSummary(root, stoppedForRateLimit
+      ? `Auto-paused for frequent requests — ${generated} generated; ${skipped} failed item(s) queued for retry.`
+      : paused
+        ? `Paused — ${generated} generated; ${skipped} failed item(s) queued for retry; previews kept.`
+        : `Done — ${generated} ready${repaired ? `, ${repaired} repaired` : ""}${skipped ? `, ${skipped} queued for retry` : ""}.`);
   }
 
   // After a rename, show "Renamed" plus the old title and an Undo control that
   // restores the original (bypassing the AI-quality guard).
   function attachUndo(row, target, root) {
+    row.dataset.renamed = "true";
     setRowStatus(row, "Renamed", "ok");
     const detailEl = row.querySelector(".row-detail");
     detailEl.classList.remove("error");
@@ -1008,7 +1371,10 @@
     button.textContent = "Restoring…";
     try {
       await renameWithFallback(target, target.title, { validate: false });
+      row.dataset.renamed = "false";
       setRowStatus(row, "Restored", "ok");
+      root.querySelector(".wf-apply").disabled = false;
+      root.querySelector(".wf-apply").textContent = "Apply";
     } catch (error) {
       button.textContent = original;
       button.disabled = false;
@@ -1018,25 +1384,46 @@
 
   async function applyPreview(rows, root) {
     stopRequested = false;
-    const readyRows = rows.filter((r) => normalizeText(r.querySelector(".title")?.value || ""));
-    if (!readyRows.length) { setCardSummary(root, "No titles to apply."); return; }
+    pauseReason = "";
+    activeOperation = "";
+    try {
+      settings = await config.loadSettings();
+    } catch (error) {
+      setCardSummary(root, error.message || "Could not read settings.");
+      return;
+    }
+    const readyRows = rows.filter((r) =>
+      r.dataset.renamed !== "true" && normalizeText(r.querySelector(".title")?.value || "")
+    );
+    if (!readyRows.length) {
+      setCardSummary(root, "All selected previews are already applied.");
+      root.querySelector(".wf-apply").disabled = true;
+      root.querySelector(".wf-apply").textContent = "Apply";
+      return;
+    }
 
     // ChatGPT moves each renamed conversation to the top of the sidebar. Apply
     // bottom-to-top so the final sidebar order matches the review list instead
     // of being reversed by successive renames.
     const applyRows = [...readyRows].reverse();
 
-    root.querySelector(".wf-stop").style.display = "";
+    activeOperation = "apply";
+
+    root.querySelector(".wf-pause-apply").disabled = false;
+    root.querySelector(".wf-pause-apply").textContent = "Pause Apply";
+    root.querySelector(".wf-pause-generate").disabled = true;
     root.querySelector(".wf-apply").disabled = true;
+    root.querySelector(".wf-apply").textContent = "Apply";
     root.querySelector(".wf-generate").disabled = true;
     root.querySelector(".back-btn").disabled = true;
     root.querySelector(".refresh-btn").disabled = true;
+    requestAutomaticRateLimitPause(root);
 
-    let renamed = 0, failed = 0;
+    let renamed = 0, failed = 0, paused = false;
 
     for (const [index, row] of applyRows.entries()) {
-      if (stopRequested) {
-        setCardSummary(root, `Stopped — ${renamed} / ${readyRows.length} renamed.`);
+      if (requestAutomaticRateLimitPause(root) || stopRequested) {
+        paused = true;
         break;
       }
       const target = row._target;
@@ -1046,25 +1433,52 @@
       try {
         await renameWithFallback(target, title);
         renamed++;
+        delete row.dataset.applyFailed;
         attachUndo(row, target, root);
       } catch (error) {
         failed++;
-        setRowStatus(row, "Failed", "error", error.message || "rename failed");
+        row.dataset.applyFailed = "true";
+        requestAutomaticRateLimitPause(root, error);
+        setRowStatus(row, "Retry queued", "error", error.message || "rename failed");
+      }
+
+
+      if (stopRequested) {
+        paused = true;
+        break;
+      }
+      if (index < applyRows.length - 1 && !(await waitForNextRequest(root, settings))) {
+        paused = true;
+        break;
       }
     }
 
-    root.querySelector(".wf-stop").style.display = "none";
-    root.querySelector(".wf-apply").disabled = false;
+    root.querySelector(".wf-pause-apply").disabled = true;
+    root.querySelector(".wf-pause-apply").textContent = "Pause Apply";
+    const remaining = selectedRows(root).some((row) =>
+      row.dataset.renamed !== "true" && normalizeText(row.querySelector(".title")?.value || "")
+    );
+    root.querySelector(".wf-apply").disabled = !remaining;
+    root.querySelector(".wf-apply").textContent = paused && remaining
+      ? "Resume Apply"
+      : (remaining && failed ? "Retry Failed" : "Apply");
     root.querySelector(".wf-generate").disabled = false;
     root.querySelector(".back-btn").disabled = false;
     root.querySelector(".refresh-btn").disabled = false;
-    setCardSummary(root, `Done — ${renamed} renamed${failed ? `, ${failed} failed` : ""}.`);
+    const stoppedForRateLimit = pauseReason === "rate-limit";
+    activeOperation = "";
+    setCardSummary(root, stoppedForRateLimit
+      ? `Auto-paused for frequent requests — ${renamed} renamed; ${failed} failed item(s) queued for retry.`
+      : paused
+        ? `Paused — ${renamed} renamed; ${failed} failed item(s) queued for retry.`
+        : `Done — ${renamed} renamed${failed ? `, ${failed} queued for retry` : ""}.`);
   }
 
   async function init() {
     settings = await config.loadSettings();
     createApp();
     renderCard();
+    installRateLimitObserver();
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
